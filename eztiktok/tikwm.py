@@ -1,226 +1,497 @@
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Callable, Optional
 
-SCHEMA_VERSION = 1
+import requests
 
-ENTRY_FIELDS = frozenset({
-    "play_url",
-    "images",
-    "username",
-    "video_id",
-    "create_time",
-    "profile_uid",
-    "content_type",
-})
+from .cache import (
+    CACHE_LOCK,
+    get_item_lock,
+    load_cache,
+    save_cache,
+)
+from .config import AppConfig, load_config
+from .tikwm import (
+    TIKWM_HEADERS,
+    content_type_from_url,
+    extract_media_id_from_url,
+    extract_username_from_url,
+    load_sessionid,
+    resolve_tiktok_redirect,
+    sanitize_filename,
+    submit_tikwm_task,
+)
 
-# Khóa dùng chung giữa các luồng tải
-CACHE_LOCK = threading.RLock()
+ProgressCallback = Optional[Callable[[int, Optional[int]], None]]
 
-# Mỗi video có một khóa riêng để tránh xử lý trùng
-_ITEM_LOCKS: dict[str, threading.RLock] = {}
-_ITEM_LOCKS_GUARD = threading.Lock()
-
-
-def get_item_lock(video_id: str) -> threading.RLock:
-    key = str(video_id)
-
-    with _ITEM_LOCKS_GUARD:
-        lock = _ITEM_LOCKS.get(key)
-
-        if lock is None:
-            lock = threading.RLock()
-            _ITEM_LOCKS[key] = lock
-
-        return lock
+# Tránh hai tác vụ ghi cùng một đường dẫn
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
+def get_file_lock(filepath: str) -> threading.Lock:
+    key = os.path.abspath(filepath)
+
+    with _FILE_LOCKS_GUARD:
+        if key not in _FILE_LOCKS:
+            _FILE_LOCKS[key] = threading.Lock()
+
+        return _FILE_LOCKS[key]
+
+
+def build_date_str(create_time: Optional[int]) -> str:
+    if create_time is not None:
+        try:
+            return datetime.fromtimestamp(
+                int(create_time),
+                tz=timezone.utc,
+            ).strftime("%y-%m-%d")
+        except (ValueError, TypeError, OSError):
+            pass
+
+    return datetime.now(timezone.utc).strftime("%y-%m-%d")
+
+
+def build_filename(
+    entry: dict,
+    ext: str = ".mp4",
+    cfg: Optional[AppConfig] = None,
+) -> str:
+
+    cfg = cfg or load_config()
+
+    username = sanitize_filename(
+        str(entry.get("username") or "unknown")
+    )
+
+    date_str = build_date_str(entry.get("create_time"))
+
+    profile_uid = entry.get("profile_uid") or "unknown"
+
+    if isinstance(profile_uid, (int, float)):
+        profile_uid = str(int(profile_uid))
+
+    video_id = sanitize_filename(
+        str(entry.get("video_id") or "unknown")
+    )
+
+    return cfg.naming_template.format(
+        date=date_str,
+        profile_uid=profile_uid,
+        username=username,
+        video_id=video_id,
+        ext=ext,
     )
 
 
-def _is_entry(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
+def subfolder_for_content_type(content_type: str) -> str:
+    if content_type == "story":
+        return "story"
 
-    images = value.get("images") or []
+    if content_type == "highlight":
+        return "highlight"
 
-    return bool(
-        value.get("play_url")
-        or (
-            isinstance(images, list)
-            and len(images) > 0
+    return ""
+
+
+def count_images_in_folder(folder: str) -> int:
+    if not os.path.isdir(folder):
+        return 0
+
+    return sum(
+        1
+        for name in os.listdir(folder)
+        if os.path.isfile(os.path.join(folder, name))
+        and name.lower().endswith(
+            (".jpg", ".jpeg", ".png", ".webp")
         )
     )
 
 
-def _normalize_entry(entry: dict) -> dict:
-    out = {
-        key: value
-        for key, value in entry.items()
-        if key in ENTRY_FIELDS
-    }
+def download_to_file(
+    url: str,
+    filepath: str,
+    headers: Optional[dict] = None,
+    cfg: Optional[AppConfig] = None,
+    progress_callback: ProgressCallback = None,
+) -> bool:
 
-    out.setdefault("content_type", "video")
-    return out
+    cfg = cfg or load_config()
 
+    if not url:
+        return False
 
-def _parse_raw(data: Any) -> dict[str, dict]:
-    if not isinstance(data, dict):
-        return {}
-
-    if "schema_version" in data and "entries" in data:
-        entries = data.get("entries") or {}
-
-        if isinstance(entries, dict):
-            return {
-                str(key): _normalize_entry(value)
-                for key, value in entries.items()
-                if _is_entry(value)
-            }
-
-        return {}
-
-    # Hỗ trợ cache định dạng cũ
-    if any(
-        _is_entry(value)
-        for value in data.values()
-        if isinstance(value, dict)
-    ):
-        return {
-            str(key): _normalize_entry(value)
-            for key, value in data.items()
-            if isinstance(value, dict) and _is_entry(value)
-        }
-
-    return {}
-
-
-def load_cache(path: str) -> dict[str, dict]:
-    if not os.path.isfile(path):
-        return {}
-
-    try:
-        with CACHE_LOCK:
-            with open(path, "r", encoding="utf-8") as file:
-                return _parse_raw(json.load(file))
-    except Exception as error:
-        print(f"Warning: could not load cache: {error}")
-        return {}
-
-
-def save_cache(entries: dict[str, dict], path: str) -> None:
-    folder = os.path.dirname(os.path.abspath(path))
+    folder = os.path.dirname(filepath) or "."
     os.makedirs(folder, exist_ok=True)
 
-    # Tạo bản chụp dữ liệu trong lúc khóa cache
-    with CACHE_LOCK:
-        snapshot = {
-            str(key): _normalize_entry(value)
-            for key, value in entries.items()
-            if isinstance(value, dict)
-        }
+    lock = get_file_lock(filepath)
 
-        wrapper = {
-            "schema_version": SCHEMA_VERSION,
-            "updated_at": _utc_now_iso(),
-            "app": "ez-tiktok-downloader",
-            "entries": snapshot,
-        }
+    with lock:
+        if os.path.isfile(filepath) and os.path.getsize(filepath) > 0:
+            return True
 
-        temp_path = None
+        temp_path = filepath + ".part"
 
         try:
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".cache_",
-                suffix=".tmp",
-                dir=folder,
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+            response = requests.get(
+                url,
+                headers=headers or TIKWM_HEADERS,
+                timeout=cfg.request_timeout,
+                stream=True,
             )
 
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(
-                    wrapper,
-                    file,
-                    indent=2,
-                    ensure_ascii=False,
-                )
+            response.raise_for_status()
+
+            total = int(
+                response.headers.get("Content-Length", 0)
+            ) or None
+
+            downloaded = 0
+
+            with response, open(temp_path, "wb") as file:
+                for chunk in response.iter_content(
+                    chunk_size=64 * 1024
+                ):
+                    if not chunk:
+                        continue
+
+                    file.write(chunk)
+                    downloaded += len(chunk)
+
+                    if progress_callback:
+                        try:
+                            progress_callback(downloaded, total)
+                        except Exception:
+                            pass
+
                 file.flush()
                 os.fsync(file.fileno())
 
-            # Thay file cũ bằng file mới sau khi ghi hoàn tất
-            os.replace(temp_path, path)
-            temp_path = None
+            if not os.path.isfile(temp_path):
+                return False
+
+            if os.path.getsize(temp_path) <= 0:
+                return False
+
+            os.replace(temp_path, filepath)
+            return True
 
         except Exception as error:
-            print(f"Warning: could not save cache: {error}")
+            print(f"Download error: {error}")
+            return False
 
         finally:
-            if temp_path and os.path.exists(temp_path):
+            if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
 
 
-def merge_entries(
-    base: dict[str, dict],
-    incoming: dict[str, dict],
-) -> dict[str, dict]:
+def do_download(
+    entry: dict,
+    output_dir: str,
+    cfg: Optional[AppConfig] = None,
+    progress_callback: ProgressCallback = None,
+) -> bool:
 
-    with CACHE_LOCK:
-        merged = dict(base)
+    cfg = cfg or load_config()
 
-        for video_id, entry in incoming.items():
-            if not isinstance(entry, dict):
-                continue
-
-            new = _normalize_entry(entry)
-            old = merged.get(video_id)
-
-            if old is None:
-                merged[video_id] = new
-                continue
-
-            old = _normalize_entry(old)
-
-            if not old.get("play_url") and new.get("play_url"):
-                merged[video_id] = new
-
-            elif not old.get("images") and new.get("images"):
-                merged[video_id] = new
-
-        return merged
-
-
-def export_cache_file(
-    entries: dict[str, dict],
-    out_path: str,
-) -> None:
-
-    save_cache(entries, out_path)
-    print(
-        f"Cache exported to {out_path} "
-        f"({len(entries)} entries, schema v1)"
+    username = sanitize_filename(
+        str(entry.get("username") or "unknown")
     )
 
+    video_id = str(entry.get("video_id") or "unknown")
 
-def import_cache_file(
-    path: str,
-    merge: bool = True,
-) -> dict[str, dict]:
+    play_url = entry.get("play_url")
+    images = entry.get("images") or []
 
-    incoming = load_cache(path)
-    print(f"Imported {len(incoming)} entries from {path}")
-    return incoming
+    content_type = entry.get("content_type") or "video"
+
+    sub = subfolder_for_content_type(content_type)
+
+    folder = (
+        os.path.join(output_dir, username, sub)
+        if sub
+        else os.path.join(output_dir, username)
+    )
+
+    os.makedirs(folder, exist_ok=True)
+
+    # Tải ảnh/slideshow
+    if images and (not play_url or content_type == "photo"):
+
+        base_name = build_filename(entry, "", cfg)
+        success = 0
+
+        for index, item in enumerate(images):
+
+            image_url = (
+                item
+                if isinstance(item, str)
+                else (
+                    item.get("url")
+                    or item.get("image_url")
+                    or ""
+                )
+            )
+
+            if not image_url:
+                continue
+
+            clean_url = image_url.split("?")[0]
+
+            ext = ".jpg"
+
+            if "." in clean_url:
+                candidate = "." + clean_url.rsplit(".", 1)[-1].lower()
+
+                if candidate in (
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".webp",
+                ):
+                    ext = candidate
+
+            filepath = os.path.join(
+                folder,
+                f"{base_name}_img_{index + 1}{ext}",
+            )
+
+            if download_to_file(
+                image_url,
+                filepath,
+                cfg=cfg,
+                progress_callback=progress_callback,
+            ):
+                success += 1
+
+        if success:
+            print(
+                f"Downloaded {success} image(s) -> {folder}"
+            )
+
+        return success > 0
+
+    # Tải video
+    if not play_url:
+        return False
+
+    if play_url.startswith("//"):
+        play_url = "https:" + play_url
+
+    filename = build_filename(entry, ".mp4", cfg)
+
+    filepath = os.path.join(folder, filename)
+
+    headers = {
+        **TIKWM_HEADERS,
+        "Referer": "https://www.tiktok.com/",
+        "Origin": "https://www.tiktok.com",
+    }
+
+    if download_to_file(
+        play_url,
+        filepath,
+        headers=headers,
+        cfg=cfg,
+        progress_callback=progress_callback,
+    ):
+        print(f"Downloaded: {filepath}")
+        return True
+
+    return False
 
 
-def load_cache_from_any(path: str) -> dict[str, dict]:
-    return load_cache(path)
+def process_one_url(
+    tiktok_url: str,
+    cache: dict,
+    output_dir: str,
+    cfg: Optional[AppConfig] = None,
+    progress_callback: ProgressCallback = None,
+) -> bool:
+
+    cfg = cfg or load_config()
+
+    tiktok_url = tiktok_url.strip()
+
+    if (
+        "tiktok.com" not in tiktok_url
+        and "douyin.com" not in tiktok_url
+    ):
+        print(f"Skipped (not TikTok): {tiktok_url[:60]}...")
+        return False
+
+    tiktok_url = resolve_tiktok_redirect(
+        tiktok_url,
+        cfg,
+    )
+
+    video_id = (
+        extract_media_id_from_url(tiktok_url)
+        or "unknown"
+    )
+
+    username = (
+        extract_username_from_url(tiktok_url)
+        or "unknown"
+    )
+
+    content_type = content_type_from_url(tiktok_url)
+
+    # Mỗi video xử lý độc lập
+    with get_item_lock(video_id):
+
+        with CACHE_LOCK:
+            cached_entry = cache.get(video_id)
+            ent = (
+                dict(cached_entry)
+                if isinstance(cached_entry, dict)
+                else None
+            )
+
+        if ent:
+            ent.setdefault("video_id", video_id)
+            ent.setdefault("username", username)
+            ent.setdefault("content_type", content_type)
+            ent.setdefault("create_time", None)
+            ent.setdefault("profile_uid", "unknown")
+
+            if ent.get("play_url") or ent.get("images"):
+                print(f"[Cache] Using cached link: {video_id}")
+
+                return do_download(
+                    ent,
+                    output_dir,
+                    cfg,
+                    progress_callback,
+                )
+
+        print(f"Extracting link for {video_id}...")
+
+        result = submit_tikwm_task(
+            tiktok_url,
+            cfg,
+        )
+
+        if not result:
+
+            if content_type == "photo":
+                print(
+                    f"TikWM failed for photo {video_id}; "
+                    "trying gallery-dl fallback..."
+                )
+
+                return gallery_dl_photo_fallback(
+                    tiktok_url,
+                    output_dir,
+                    username,
+                    cfg,
+                )
+
+            print(f"Extraction failed for {video_id}")
+            return False
+
+        entry = {
+            "username": result.get("username") or username,
+            "play_url": result.get("play_url"),
+            "video_id": result.get("video_id") or video_id,
+            "images": result.get("images") or [],
+            "create_time": result.get("create_time"),
+            "profile_uid": result.get("profile_uid") or "unknown",
+            "content_type": content_type,
+        }
+
+        with CACHE_LOCK:
+            cache[video_id] = entry
+            snapshot = dict(cache)
+
+        save_cache(snapshot, cfg.cache_path)
+
+        return do_download(
+            entry,
+            output_dir,
+            cfg,
+            progress_callback,
+        )
+
+
+def gallery_dl_photo_fallback(
+    tiktok_url: str,
+    output_dir: str,
+    username: str,
+    cfg: Optional[AppConfig] = None,
+) -> bool:
+
+    cfg = cfg or load_config()
+
+    folder = os.path.join(
+        output_dir,
+        sanitize_filename(username or "unknown"),
+        "photo",
+    )
+
+    os.makedirs(folder, exist_ok=True)
+
+    before = count_images_in_folder(folder)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "gallery_dl",
+        "--no-skip",
+        "-D",
+        folder,
+    ]
+
+    if cfg.cookies_path and os.path.isfile(cfg.cookies_path):
+        cmd.extend([
+            "--cookies",
+            cfg.cookies_path,
+        ])
+
+    cmd.append(tiktok_url)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    except Exception as error:
+        print(f"gallery-dl error: {error}")
+        return False
+
+    if result.returncode != 0:
+        message = (
+            result.stderr or result.stdout or ""
+        ).strip()
+
+        if message:
+            print(message[:500])
+
+        return False
+
+    after = count_images_in_folder(folder)
+
+    if after <= before:
+        return False
+
+    print(
+        f"Downloaded {after - before} image(s) -> {folder}"
+    )
+
+    return True
